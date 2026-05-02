@@ -33,6 +33,10 @@ Open **http://app.localhost:8080**.
 - A GitHub account with access to the `sophon-data` org's container registry. If you can't pull `ghcr.io/sophon-data/sophon-backend`, ask Jake to add you.
 - ~2 GB free disk for images and Postgres data
 
+## Linux: secure your PAT
+
+Docker stores GHCR credentials in `~/.docker/config.json`. On macOS with Docker Desktop they go to the Keychain. **On Linux without a credential helper, your PAT is written to that file in plaintext.** Install `docker-credential-pass` (or `docker-credential-secretservice`) and configure Docker to use it before running `sophon login`. See [Docker's credential-store docs](https://docs.docker.com/engine/reference/commandline/login/#credential-stores).
+
 ## Privacy
 
 The backend mounts `~/.claude/projects` **read-only**. All parsed data lives in a local Docker volume (`sophon_postgres-data`). Nothing leaves your machine. Both published ports (`8080`, `8001`) bind to `127.0.0.1` only.
