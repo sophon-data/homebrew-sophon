@@ -1,0 +1,81 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sophon
+      POSTGRES_PASSWORD: sophon
+      POSTGRES_DB: sophon
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sophon"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    image: ghcr.io/sophon-data/sophon-backend:${SOPHON_VERSION:-latest}
+    pull_policy: always
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CLAUDE_LOGS_PATH: /claude-logs
+      DATABASE_URL: postgresql+asyncpg://sophon:sophon@postgres:5432/sophon
+    volumes:
+      - "${HOME}/.claude/projects:/claude-logs:ro"
+    ports:
+      - "127.0.0.1:8001:8001"
+    command: sh -c "alembic upgrade head && uvicorn sophon.main:app --host 0.0.0.0 --port 8001"
+    restart: unless-stopped
+
+  worker:
+    image: ghcr.io/sophon-data/sophon-backend:${SOPHON_VERSION:-latest}
+    pull_policy: always
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CLAUDE_LOGS_PATH: /claude-logs
+      DATABASE_URL: postgresql+asyncpg://sophon:sophon@postgres:5432/sophon
+    volumes:
+      - "${HOME}/.claude/projects:/claude-logs:ro"
+    command: celery -A sophon.celery:celery_app worker --loglevel=info
+    restart: unless-stopped
+
+  beat:
+    image: ghcr.io/sophon-data/sophon-backend:${SOPHON_VERSION:-latest}
+    pull_policy: always
+    depends_on:
+      redis:
+        condition: service_started
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+    command: celery -A sophon.celery:celery_app beat --loglevel=info
+    restart: unless-stopped
+
+  frontend:
+    image: ghcr.io/sophon-data/sophon-frontend:${SOPHON_VERSION:-latest}
+    pull_policy: always
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8080:5173"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

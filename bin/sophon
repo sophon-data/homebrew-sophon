@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+COMPOSE_FILE="${SOPHON_COMPOSE_FILE:-/usr/local/etc/sophon/docker-compose.yml}"
+if [[ ! -f "$COMPOSE_FILE" ]]; then
+  # Apple Silicon Homebrew prefix
+  COMPOSE_FILE="/opt/homebrew/etc/sophon/docker-compose.yml"
+fi
+if [[ ! -f "$COMPOSE_FILE" ]]; then
+  echo "sophon: cannot locate docker-compose.yml (looked in /usr/local/etc/sophon and /opt/homebrew/etc/sophon)" >&2
+  echo "        set SOPHON_COMPOSE_FILE to override" >&2
+  exit 1
+fi
+
+require_docker() {
+  if ! command -v docker &>/dev/null; then
+    echo "sophon: docker is not installed." >&2
+    echo "        Install Docker Desktop: https://www.docker.com/products/docker-desktop" >&2
+    exit 1
+  fi
+  if ! docker info &>/dev/null; then
+    echo "sophon: docker is installed but not running. Start Docker Desktop and try again." >&2
+    exit 1
+  fi
+}
+
+dc() {
+  docker compose -f "$COMPOSE_FILE" -p sophon "$@"
+}
+
+cmd_login() {
+  require_docker
+  cat <<'EOF'
+Sophon's container images are private on GitHub Container Registry (GHCR).
+You need a GitHub Personal Access Token (classic) with the `read:packages` scope.
+
+Create one at: https://github.com/settings/tokens
+
+EOF
+  read -rp "GitHub username: " gh_user
+  read -rsp "GitHub PAT (input hidden): " gh_pat
+  echo
+  if [[ -z "$gh_user" || -z "$gh_pat" ]]; then
+    echo "sophon: username and PAT are required." >&2
+    exit 1
+  fi
+  echo "$gh_pat" | docker login ghcr.io -u "$gh_user" --password-stdin
+  echo "sophon: logged in to ghcr.io as $gh_user."
+}
+
+cmd_start() {
+  require_docker
+  echo "==> Pulling images..."
+  if ! dc pull; then
+    cat >&2 <<'EOF'
+
+Pull failed. If you see "denied" or "unauthorized", run:
+  sophon login
+
+EOF
+    exit 1
+  fi
+  echo "==> Starting stack..."
+  dc up -d
+  cat <<'EOF'
+
+Sophon is starting. Give it ~10 seconds for migrations and the API to come up.
+
+  Dashboard: http://app.localhost:8080
+  API:       http://localhost:8001
+
+  sophon logs    tail logs
+  sophon status  list services
+  sophon stop    stop containers
+EOF
+}
+
+cmd_stop() {
+  require_docker
+  dc down
+}
+
+cmd_update() {
+  require_docker
+  dc pull
+  dc up -d --force-recreate
+}
+
+cmd_logs() {
+  require_docker
+  dc logs -f "$@"
+}
+
+cmd_status() {
+  require_docker
+  dc ps
+}
+
+cmd_uninstall() {
+  require_docker
+  read -rp "Stop Sophon and DELETE the local Postgres volume (all parsed sessions)? [y/N] " ans
+  if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+    dc down --volumes
+    echo "sophon: stack and volumes removed. Run 'brew uninstall sophon' to remove the CLI."
+  else
+    echo "sophon: aborted."
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+sophon — run Sophon locally
+
+Usage:
+  sophon login      Authenticate Docker with ghcr.io (one-time)
+  sophon start      Pull images and start the stack
+  sophon stop       Stop the stack (keeps data)
+  sophon update     Pull latest images and restart
+  sophon logs       Tail container logs (pass service name to filter)
+  sophon status     Show running services
+  sophon uninstall  Stop and delete the local Postgres volume
+
+After 'sophon start':
+  Dashboard: http://app.localhost:8080
+  API:       http://localhost:8001
+EOF
+}
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  login)     cmd_login ;;
+  start|up)  cmd_start ;;
+  stop|down) cmd_stop ;;
+  update|upgrade) cmd_update ;;
+  logs)      cmd_logs "$@" ;;
+  status|ps) cmd_status ;;
+  uninstall) cmd_uninstall ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "sophon: unknown command '$cmd'" >&2; usage; exit 1 ;;
+esac
