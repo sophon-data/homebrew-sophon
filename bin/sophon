@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Resolve script directory, following symlinks (brew installs sophon as a symlink
+# from <prefix>/bin into the cellar; libexec lives next to it inside the cellar).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+LIBEXEC_DIR="${SOPHON_LIBEXEC:-$SCRIPT_DIR/../libexec}"
+
 COMPOSE_FILE="${SOPHON_COMPOSE_FILE:-/usr/local/etc/sophon/docker-compose.yml}"
 if [[ ! -f "$COMPOSE_FILE" ]]; then
-  # Apple Silicon Homebrew prefix
   COMPOSE_FILE="/opt/homebrew/etc/sophon/docker-compose.yml"
 fi
-if [[ ! -f "$COMPOSE_FILE" ]]; then
-  echo "sophon: cannot locate docker-compose.yml (looked in /usr/local/etc/sophon and /opt/homebrew/etc/sophon)" >&2
-  echo "        set SOPHON_COMPOSE_FILE to override" >&2
-  exit 1
-fi
+
+# ---------- guards ----------
+
+require_compose_file() {
+  if [[ ! -f "$COMPOSE_FILE" ]]; then
+    echo "sophon: cannot locate docker-compose.yml (looked in /usr/local/etc/sophon and /opt/homebrew/etc/sophon)" >&2
+    echo "        set SOPHON_COMPOSE_FILE to override" >&2
+    exit 1
+  fi
+}
 
 require_docker() {
   if ! command -v docker &>/dev/null; then
@@ -24,11 +39,32 @@ require_docker() {
   fi
 }
 
+require_python() {
+  if ! command -v python3 &>/dev/null; then
+    echo "sophon: python3 is required for 'sophon login'/'sophon logout'." >&2
+    echo "        Install Python 3.11+ (e.g., 'brew install python@3.13')." >&2
+    exit 1
+  fi
+}
+
 dc() {
+  require_compose_file
   docker compose -f "$COMPOSE_FILE" -p sophon "$@"
 }
 
-cmd_login() {
+# ---------- internal helpers ----------
+
+_account_login() {
+  require_python
+  PYTHONPATH="$LIBEXEC_DIR" python3 -m sophon_login login "$@"
+}
+
+_account_logout() {
+  require_python
+  PYTHONPATH="$LIBEXEC_DIR" python3 -m sophon_login logout "$@"
+}
+
+_ghcr_login_interactive() {
   require_docker
   cat <<'EOF'
 Sophon's container images are private on GitHub Container Registry (GHCR).
@@ -48,94 +84,127 @@ EOF
   echo "sophon: logged in to ghcr.io as $gh_user."
 }
 
-cmd_start() {
+_stack_start() {
   require_docker
   echo "==> Pulling images..."
   if ! dc pull; then
     cat >&2 <<'EOF'
 
 Pull failed. If you see "denied" or "unauthorized", run:
-  sophon login
+  sophon dev ghcr-login
 
 EOF
     exit 1
   fi
   echo "==> Starting stack..."
   dc up -d
-  cat <<'EOF'
-
-Sophon is starting. Give it ~10 seconds for migrations and the API to come up.
-
-  Dashboard: http://app.localhost:8080
-  API:       http://localhost:8001
-
-  sophon logs    tail logs
-  sophon status  list services
-  sophon stop    stop containers
-EOF
 }
 
-cmd_stop() {
+_stack_stop() {
   require_docker
   dc down
 }
 
-cmd_update() {
-  require_docker
-  dc pull
-  dc up -d --force-recreate
+_print_dashboard_banner() {
+  cat <<'EOF'
+
+Sophon is running.
+
+  Dashboard: http://app.localhost:8080
+  API:       http://localhost:8001
+EOF
 }
 
-cmd_logs() {
-  require_docker
-  dc logs -f "$@"
+# ---------- user-facing commands ----------
+
+cmd_login() {
+  _account_login "$@"
+  echo
+  echo "==> Authorize Docker to pull Sophon images"
+  _ghcr_login_interactive
+  echo
+  _stack_start
+  _print_dashboard_banner
 }
 
-cmd_status() {
-  require_docker
-  dc ps
+cmd_logout() {
+  _account_logout "$@"
+}
+
+cmd_stop() {
+  _stack_stop
 }
 
 cmd_uninstall() {
   require_docker
-  read -rp "Stop Sophon and DELETE the local Postgres volume (all parsed sessions)? [y/N] " ans
-  if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
-    dc down --volumes
-    echo "sophon: stack and volumes removed. Run 'brew uninstall sophon' to remove the CLI."
-  else
+  read -rp "Stop Sophon and DELETE all local data (Postgres volume, auth config)? [y/N] " ans
+  if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
     echo "sophon: aborted."
+    return 0
   fi
+  dc down --volumes || true
+  _account_logout || true
+  echo "sophon: stack, volumes, and local config removed."
+  echo "        Run 'brew uninstall sophon' to remove the CLI itself."
 }
+
+# ---------- `sophon dev` subcommands ----------
+
+dev_usage() {
+  cat <<'EOF'
+sophon dev — operator/debug subcommands
+
+Usage:
+  sophon dev ghcr-login   Re-authenticate Docker with ghcr.io
+  sophon dev start        Pull images and start the stack (skip the login wizard)
+  sophon dev status       List running services
+  sophon dev logs [svc]   Tail container logs
+  sophon dev update       Pull latest images and restart
+EOF
+}
+
+cmd_dev() {
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    ghcr-login) _ghcr_login_interactive ;;
+    start)      _stack_start; _print_dashboard_banner ;;
+    status|ps)  require_docker; dc ps ;;
+    logs)       require_docker; dc logs -f "$@" ;;
+    update)     require_docker; dc pull; dc up -d --force-recreate ;;
+    ""|-h|--help|help) dev_usage ;;
+    *) echo "sophon dev: unknown subcommand '$sub'" >&2; dev_usage; exit 1 ;;
+  esac
+}
+
+# ---------- top-level dispatch ----------
 
 usage() {
   cat <<'EOF'
 sophon — run Sophon locally
 
 Usage:
-  sophon login      Authenticate Docker with ghcr.io (one-time)
-  sophon start      Pull images and start the stack
-  sophon stop       Stop the stack (keeps data)
-  sophon update     Pull latest images and restart
-  sophon logs       Tail container logs (pass service name to filter)
-  sophon status     Show running services
-  sophon uninstall  Stop and delete the local Postgres volume
+  sophon login      Sign in and start the app
+  sophon logout     Sign out (clears the local auth token)
+  sophon stop       Stop the app (keeps your data)
+  sophon uninstall  Stop the app and delete all local data
 
-After 'sophon start':
-  Dashboard: http://app.localhost:8080
-  API:       http://localhost:8001
+  sophon dev …      Operator/debug subcommands (see `sophon dev help`)
+
+Environment:
+  SOPHON_API_BASE_URL  Override the auth/API base URL for 'sophon login'
+                       (default: http://localhost:8001)
 EOF
 }
 
 cmd="${1:-}"
 shift || true
 case "$cmd" in
-  login)     cmd_login ;;
-  start|up)  cmd_start ;;
-  stop|down) cmd_stop ;;
-  update|upgrade) cmd_update ;;
-  logs)      cmd_logs "$@" ;;
-  status|ps) cmd_status ;;
-  uninstall) cmd_uninstall ;;
+  login)      cmd_login "$@" ;;
+  logout)     cmd_logout "$@" ;;
+  stop|down)  cmd_stop ;;
+  uninstall)  cmd_uninstall ;;
+  dev)        cmd_dev "$@" ;;
   ""|-h|--help|help) usage ;;
   *) echo "sophon: unknown command '$cmd'" >&2; usage; exit 1 ;;
 esac
