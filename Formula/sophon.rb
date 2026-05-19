@@ -5,8 +5,11 @@ class Sophon < Formula
   version "0.1.0"
   license "Proprietary"
 
+  depends_on "python@3.13"
+
   def install
     bin.install "bin/sophon"
+    libexec.install "libexec/sophon_login"
     (etc/"sophon").install "share/docker-compose.yml"
   end
 
@@ -15,11 +18,13 @@ class Sophon < Formula
       Sophon needs Docker Desktop running:
         https://www.docker.com/products/docker-desktop
 
-      One-time auth (Sophon images are private on GHCR):
+      To sign in and start the app:
         sophon login
 
-      Then:
-        sophon start
+      Other commands:
+        sophon logout     sign out
+        sophon stop       stop the app
+        sophon uninstall  remove all local data
     EOS
   end
 
